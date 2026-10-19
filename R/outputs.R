@@ -26,25 +26,35 @@
 
 #' @rdname render_output
 #' @importFrom mia convertToPhyloseq
-.render_download <- function(input, output, rObjects){
+.render_download <- function(input, output, rObjects, registry = NULL){
     # nocov start
-    output$download <- downloadHandler(
-        filename = function(){
-            suffix <- switch(input$export_format, TreeSE = "rds",
-                phyloseq = "rds", BIOM = "biom", Mothur = "zip", QIIME2 = "zip")
-            
-            paste0(tolower(input$export_format), "-", Sys.Date(), ".", suffix)
+    filename <- function(){
+        suffix <- switch(input$export_format, TreeSE = "rds",
+            phyloseq = "rds", BIOM = "biom", Mothur = "zip", QIIME2 = "zip")
+        
+        paste0(tolower(input$export_format), "-", Sys.Date(), ".", suffix)
+    }
+    content <- function(file) switch(
+        input$export_format,
+        TreeSE = saveRDS(rObjects$tse, file),
+        phyloseq = {
+            pseq <- convertToPhyloseq(rObjects$tse, assay.type = input$export.assay)
+            saveRDS(pseq, file)
         },
-        content = function(file) switch(
-            input$export_format,
-            TreeSE = saveRDS(rObjects$tse, file),
-            phyloseq = {
-                pseq <- convertToPhyloseq(rObjects$tse, assay.type = input$export.assay)
-                saveRDS(pseq, file)
-            },
-            .write_foreign(file, rObjects$tse, input$export.assay, input$export_format)
-        )
+        .write_foreign(file, rObjects$tse, input$export.assay, input$export_format)
     )
+    
+    if (is.null(registry)) {
+        output$download <- downloadHandler(
+            filename = filename, content = content)
+    } else {
+        # Same handler, additionally registered with the Galaxy download
+        # registry, so the "Send to Galaxy" button next to the download button
+        # reproduces the file without a second implementation of any export
+        # format. See R/galaxy_ie.R.
+        output$download <- galaxy_ie_download_with(
+            registry, "download", filename = filename, content = content)
+    }
     # nocov end
     invisible(NULL)
 }

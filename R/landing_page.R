@@ -18,6 +18,14 @@
 #' @importFrom utils data
 .landing_page <- function(FUN, input, output, session) {
     # nocov start
+    
+    # Galaxy Interactive Tool wiring: "Send to Galaxy" buttons for the export
+    # download, and the import of the raw tables staged by the tool wrapper.
+    # Both are no-ops outside Galaxy, see R/galaxy_ie.R and R/galaxy_input.R.
+    galaxy_ie_app("miadash", "MIADASH_OUTPUT_DIR")
+    galaxy_registry <- galaxy_ie_send_server(input, output, session,
+        label = "miaDash results")
+    
     mia_datasets <- .import_datasets()
     
     output$allPanels <- renderUI({
@@ -28,7 +36,8 @@
             dashboardSidebar(disable = TRUE),
             dashboardBody(
                 
-                tags$head(tags$style(HTML(".btn-primary {color: white}"))),
+                tags$head(tags$style(HTML(".btn-primary {color: white}")),
+                    galaxy_ie_send_ui(ids = ls(galaxy_registry))),
               
                 fluidRow(
                     .define_import_panel(mia_datasets),
@@ -66,7 +75,15 @@
     .create_launch_observers(FUN, input, session, rObjects)
     
     .render_overview(output, rObjects)
-    .render_download(input, output, rObjects)
+    .render_download(input, output, rObjects, galaxy_registry)
+
+    # Import the raw tables staged by the Galaxy tool wrapper, if any. Runs once
+    # on the first flush, and reads only environment variables, so nothing here
+    # can loop; isolate() keeps the error path of .update_tse-style helpers from
+    # registering a reactive dependency on rObjects$tse.
+    observe({
+        isolate(.galaxy_staged_import(rObjects, pObjects))
+    })
 
     invisible(NULL)
     # nocov end
