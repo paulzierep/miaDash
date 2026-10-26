@@ -393,8 +393,17 @@
             updateSelectInput(session, inputId = "assay.type",
                 choices = assayNames(rObjects$tse))
             
+            # input$margin only exists once the Estimate panel has been rendered,
+            # which is after the first flush when the TreeSE was imported before
+            # the app started (the staged tables of the Galaxy tool). Fall back to
+            # the default the radio button starts with instead of letting switch()
+            # abort the whole observer, which used to take the landing page with it.
+            margin <- input$margin
+            if (is.null(margin) || !length(margin)) {
+                margin <- "features"
+            }
             updateSelectInput(session, inputId = "trans.tree",
-                choices = switch(input$margin,
+                choices = switch(margin,
                 features = rowTreeNames(rObjects$tse),
                 samples = colTreeNames(rObjects$tse)))
             
