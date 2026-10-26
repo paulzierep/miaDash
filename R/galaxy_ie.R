@@ -73,6 +73,20 @@ galaxy_ie_history <- function() Sys.getenv("HISTORY_ID", unset = "")
 galaxy_ie_key <- function() Sys.getenv("API_KEY", unset = "")
 galaxy_ie_output_dir <- function() Sys.getenv(galaxy_ie$app$output_env, unset = "")
 
+# Where the upload log is written. It is deliberately not the output directory:
+# Galaxy turns every file in there into a dataset of the results collection, and a
+# log is not a result. The tool XML points this at the job working directory, and
+# a plain `docker run` (which sets neither variable) keeps the log next to the
+# outputs.
+galaxy_ie_log_dir <- function() {
+  log_env <- paste0(toupper(galaxy_ie$app$prefix), "_LOG_DIR")
+  log_dir <- Sys.getenv(log_env, unset = "")
+  if (nzchar(log_dir)) {
+    return(log_dir)
+  }
+  galaxy_ie_output_dir()
+}
+
 galaxy_ie_output_path <- function(name) {
   output_dir <- galaxy_ie_output_dir()
   if (!nzchar(output_dir)) {
@@ -89,10 +103,10 @@ galaxy_ie_log <- function(...) {
     galaxy_ie$app$prefix, " ", paste0(..., collapse = "")
   )
   message(line)
-  output_dir <- galaxy_ie_output_dir()
-  if (nzchar(output_dir)) {
-    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-    cat(line, "\n", file = file.path(output_dir, "galaxy_upload.log"), append = TRUE)
+  log_dir <- galaxy_ie_log_dir()
+  if (nzchar(log_dir)) {
+    dir.create(log_dir, recursive = TRUE, showWarnings = FALSE)
+    cat(line, "\n", file = file.path(log_dir, "galaxy_upload.log"), append = TRUE)
   }
 }
 
@@ -200,12 +214,29 @@ galaxy_ie_send_async <- function(path, name = basename(path), filetype = "auto")
   # Exactly the same call galaxy_ie_send() makes: `put` derives the dataset name
   # from the file's basename, so the path has to be the saved copy in the output
   # directory (which is named after the download) rather than a temp file.
+  #
+  # The child reports its own outcome in the upload log: a failed upload used to
+  # vanish with the child's stdout, which left the notification claiming success
+  # and nothing to debug with.
+  log_path <- file.path(galaxy_ie_log_dir(), "galaxy_upload.log")
   expression <- sprintf(
-    "invisible(system2(%s, c(\"-p\", %s, \"-t\", %s, \"--history-id\", %s), stdout = FALSE, stderr = FALSE))",
+    paste0(
+      "out <- suppressWarnings(system2(%s, ",
+      "c(\"-p\", %s, \"-t\", %s, \"--history-id\", %s), ",
+      "stdout = TRUE, stderr = TRUE)); ",
+      "status <- attr(out, \"status\"); if (is.null(status)) status <- 0L; ",
+      "cat(format(Sys.time(), \"%%Y-%%m-%%dT%%H:%%M:%%S%%z\"), ",
+      "\" %s upload finish name=\", %s, \" exit_status=\", status, ",
+      "if (length(out)) paste0(\" output=\", paste(out, collapse = \" | \")) ",
+      "else \" output=<empty>\", \"\\n\", file = %s, append = TRUE, sep = \"\")"
+    ),
     encodeString(put, quote = "\""),
     encodeString(normalizePath(path, mustWork = FALSE), quote = "\""),
     encodeString(filetype, quote = "\""),
-    encodeString(galaxy_ie_history(), quote = "\"")
+    encodeString(galaxy_ie_history(), quote = "\""),
+    galaxy_ie$app$prefix,
+    encodeString(name, quote = "\""),
+    encodeString(log_path, quote = "\"")
   )
   system2(
     rscript,
@@ -214,7 +245,7 @@ galaxy_ie_send_async <- function(path, name = basename(path), filetype = "auto")
     stderr = FALSE,
     wait = FALSE
   )
-  galaxy_ie_log("async upload started name=", name, " path=", path)
+  galaxy_ie_log("async upload started name=", name, " path=", path, " log=", log_path)
   invisible(TRUE)
 }
 
@@ -244,6 +275,51 @@ galaxy_ie_download_with <- function(registry, id, filename, content, contentType
   shiny::downloadHandler(filename = filename, content = content, contentType = contentType)
 }
 
+# The hosting application's own download outputs are not registered above: iSEE
+# renders the download button of its export modal itself, and the only handle on
+# what that button produces is shiny's per-session download registry, which holds
+# the file name and the content function of every rendered download output.
+#
+# `session$downloads` is that registry. Reading it here rather than copying the
+# archive code means the file that is sent is the file the hosting app produces,
+# and it keeps working when the hosting app changes how it builds it.
+galaxy_ie_session_handler <- function(session, id) {
+  downloads <- tryCatch(session$downloads, error = function(e) NULL)
+  if (is.null(downloads)) {
+    return(NULL)
+  }
+  entry <- tryCatch(downloads$get(id), error = function(e) NULL)
+  if (is.null(entry) || !is.function(entry$func)) {
+    return(NULL)
+  }
+  list(
+    filename = entry$filename,
+    content = entry$func,
+    contentType = if (is.null(entry$contentType)) {
+      "application/octet-stream"
+    } else {
+      entry$contentType
+    }
+  )
+}
+
+# The download output iSEE renders in its own export modal, which is the only
+# hosting-application export a user can reach. iSEE keeps the id in a namespace
+# constant, so it is read from there rather than copied as a string that a new
+# iSEE release could rename. NULL when iSEE is not installed, so an app that does
+# not use iSEE simply has nothing to add.
+galaxy_ie_isee_export_id <- function() {
+  if (!requireNamespace("iSEE", quietly = TRUE)) {
+    return(NULL)
+  }
+  id <- get0(".generalExportOutputDownload",
+    envir = asNamespace("iSEE"), inherits = FALSE)
+  if (is.null(id) || !is.character(id) || length(id) != 1L || !nzchar(id)) {
+    return(NULL)
+  }
+  id
+}
+
 # The file name a download button would use, as a plain string. Galaxy names the
 # dataset after it, so it has to survive a path and keep its extension.
 galaxy_ie_download_name <- function(handler, id) {
@@ -270,7 +346,8 @@ galaxy_ie_download_name <- function(handler, id) {
 # which is only rendered once the user asks for it.
 #
 # `ids` is the allow-list of download output ids that get a button, i.e. the
-# keys of the download registry. It has to be an allow-list rather than a
+# keys of the download registry plus the hosting application's own export (see
+# galaxy_ie_isee_export_id()). It has to be an allow-list rather than a
 # deny-list because iSEE's own machinery also renders download links
 # (iSEE_INTERNAL_memory_export and friends), which the injected button must not
 # attach to: there is nothing sensible to upload for those.
@@ -397,6 +474,12 @@ galaxy_ie_send_server <- function(input, output, session, label = "results") {
     )
 
     handler <- get0(id, envir = registry, inherits = FALSE)
+    if (is.null(handler)) {
+      # A download output the hosting application rendered itself (iSEE's export
+      # modal): shiny has its file name and content function, so the button
+      # next to it can send the very file it downloads.
+      handler <- galaxy_ie_session_handler(session, id)
+    }
     if (is.null(handler)) {
       showNotification(
         paste0("There is nothing to send for ", id, "."),

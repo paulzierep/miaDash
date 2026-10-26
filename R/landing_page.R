@@ -37,7 +37,8 @@
             dashboardBody(
                 
                 tags$head(tags$style(HTML(".btn-primary {color: white}")),
-                    galaxy_ie_send_ui(ids = ls(galaxy_registry))),
+                    galaxy_ie_send_ui(ids = c(ls(galaxy_registry),
+                        galaxy_ie_isee_export_id()))),
               
                 fluidRow(
                     .define_import_panel(mia_datasets),
