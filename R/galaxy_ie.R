@@ -249,6 +249,56 @@ galaxy_ie_send_async <- function(path, name = basename(path), filetype = "auto")
   invisible(TRUE)
 }
 
+# --- archives ----------------------------------------------------------------
+#
+# iSEE's export panel produces one zip holding every selected panel, but a zip is
+# not a result a history can use: no Galaxy viewer opens it and no tool can take a
+# figure out of it. The members are therefore unpacked next to it and each one is
+# sent as its own dataset (a PDF per figure, a CSV per table).
+#
+# Returns the paths of the files that were unpacked, or a zero-length vector when
+# `path` is not an archive or holds nothing that could be sent.
+galaxy_ie_expand_archive <- function(path, dir = dirname(path)) {
+  members <- tryCatch(utils::unzip(path, list = TRUE), error = function(e) NULL)
+  if (is.null(members) || !nrow(members)) {
+    return(character())
+  }
+  # Directory entries and macOS resource forks are not results.
+  wanted <- members$Name
+  wanted <- wanted[!grepl("/$", wanted)]
+  wanted <- wanted[!grepl("(^|/)__MACOSX/", wanted)]
+  wanted <- wanted[!startsWith(basename(wanted), ".")]
+  if (!length(wanted)) {
+    return(character())
+  }
+
+  staging <- tempfile("galaxy_ie_unpack_")
+  dir.create(staging, recursive = TRUE, showWarnings = FALSE)
+  on.exit(unlink(staging, recursive = TRUE, force = TRUE), add = TRUE)
+  utils::unzip(path, files = wanted, exdir = staging, junkpaths = TRUE)
+
+  # `put` names the dataset after the file's basename, so every member keeps its
+  # own name; only the characters a path cannot carry are replaced.
+  extracted <- character()
+  for (member in wanted) {
+    source <- file.path(staging, basename(member))
+    if (!file.exists(source)) {
+      next
+    }
+    target <- file.path(dir, gsub("[^A-Za-z0-9._-]", "_", basename(member)))
+    if (!file.copy(source, target, overwrite = TRUE)) {
+      next
+    }
+    extracted <- c(extracted, target)
+  }
+  if (!length(extracted)) {
+    # Nothing usable inside: keep the archive rather than losing what iSEE made.
+    return(character())
+  }
+  unlink(path)
+  extracted
+}
+
 # --- the download registry ---------------------------------------------------
 #
 # A download button cannot be reused for an upload: its content function is only
@@ -514,38 +564,93 @@ galaxy_ie_send_server <- function(input, output, session, label = "results") {
       return()
     }
 
+    # iSEE's export is one archive of every selected panel, and a zip is not a
+    # result a history can use. Send what is inside it instead of the archive.
+    files <- galaxy_ie_expand_archive(path)
+    if (length(files)) {
+      galaxy_ie_log(
+        "unpacked archive name=", name,
+        " files=", paste0(basename(files), collapse = ",")
+      )
+    } else {
+      files <- path
+    }
+    names <- basename(files)
+
     persisted <- identical(
       dirname(path),
       normalizePath(galaxy_ie_output_dir(), mustWork = FALSE)
     )
     if (persisted) {
-      upload_started <- tryCatch(
-        {
-          galaxy_ie_send_async(path, name)
-          TRUE
-        },
-        error = function(e) {
-          galaxy_ie_log("could not start direct upload name=", name, " error=", conditionMessage(e))
-          FALSE
-        }
-      )
+      started <- 0L
+      for (i in seq_along(files)) {
+        uploaded <- tryCatch(
+          {
+            galaxy_ie_send_async(files[[i]], names[[i]])
+            TRUE
+          },
+          error = function(e) {
+            galaxy_ie_log(
+              "could not start direct upload name=", names[[i]],
+              " error=", conditionMessage(e)
+            )
+            FALSE
+          }
+        )
+        if (uploaded) started <- started + 1L
+      }
       galaxy_ie_log(
-        "saved output name=", name,
-        " path=", normalizePath(path, mustWork = FALSE),
-        " bytes=", file.info(path)$size,
-        " direct_upload=", if (upload_started) "started asynchronously" else "not started"
+        "saved output files=", paste0(names, collapse = ","),
+        " dir=", normalizePath(dirname(path), mustWork = FALSE),
+        " bytes=", paste0(file.info(files)$size, collapse = ","),
+        " direct_upload=",
+        if (started > 0L) paste0(started, " of ", length(files), " started asynchronously")
+        else "not started"
       )
       result <- list(
         ok = TRUE,
-        message = paste0(
-          "Saved ", name, ". Direct history upload was started in the background; ",
-          "the file will also appear in ", label, " when this interactive job ends."
-        )
+        message = if (length(files) == 1L) {
+          paste0(
+            "Saved ", names, ". Direct history upload was started in the ",
+            "background; the file will also appear in ", label,
+            " when this interactive job ends."
+          )
+        } else {
+          paste0(
+            "Saved ", length(files), " files (", paste(names, collapse = ", "),
+            "). Direct history uploads were started in the background; the files ",
+            "will also appear in ", label, " when this interactive job ends."
+          )
+        }
       )
     } else {
       # Not running as a Galaxy interactive tool: there is no job directory to
       # discover, so send it and let the API be the only destination.
-      result <- galaxy_ie_send(path, name)
+      results <- lapply(seq_along(files), function(i) {
+        galaxy_ie_send(files[[i]], names[[i]])
+      })
+      failed <- !vapply(results, function(r) isTRUE(r$ok), logical(1))
+      result <- if (!any(failed)) {
+        list(
+          ok = TRUE,
+          message = if (length(names) == 1L) {
+            results[[1L]]$message
+          } else {
+            paste0(
+              "Added ", length(names), " files to the Galaxy history (",
+              paste(names, collapse = ", "), ")"
+            )
+          }
+        )
+      } else {
+        list(
+          ok = FALSE,
+          message = paste(
+            vapply(results[failed], function(r) r$message, character(1)),
+            collapse = "\n"
+          )
+        )
+      }
     }
 
     showNotification(
